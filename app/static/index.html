@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Knowledge Base Console (Airbyte + Pinecone)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/ui/style.css" />
+  </head>
+  <body>
+    <div class="bg"></div>
+    <main class="layout">
+      <aside class="panel sidebar">
+        <div class="panel-head">
+          <h1>Knowledge Base</h1>
+          <p>Google Docs → Airbyte → Pinecone</p>
+        </div>
+
+        <div class="create-client">
+          <input id="clientName" type="text" placeholder="Client name" />
+          <input id="pineconeNamespace" type="text" placeholder="Pinecone namespace (e.g. client-a)" />
+          <button id="createClientBtn">Create Client</button>
+        </div>
+
+        <div id="clientList" class="client-list"></div>
+      </aside>
+
+      <section class="panel workspace">
+        <header class="workspace-head">
+          <div>
+            <h2 id="activeClientName">Select a client</h2>
+            <p id="activeClientId" class="muted">No context selected</p>
+            <p id="activeClientCfg" class="mono small muted"></p>
+          </div>
+          <div class="badge-row">
+            <span id="authBadge" class="badge danger">Not authenticated</span>
+            <button id="refreshClientBtn" class="ghost">Refresh</button>
+          </div>
+        </header>
+
+        <section class="flow-steps">
+          <div class="card step">
+            <h3>1. OAuth</h3>
+            <p>Link this client with Google (Drive read).</p>
+            <button id="oauthBtn">Authenticate with Google</button>
+          </div>
+
+          <div class="card step">
+            <h3>2. Paste link</h3>
+            <p>Drive folder link (for sync) or Doc link (for list).</p>
+            <div class="row">
+              <input id="linkInput" type="text" placeholder="Drive folder or Doc URL" />
+              <button id="addLinkBtn">Add</button>
+            </div>
+            <div id="linkSummary" class="link-summary muted small"></div>
+          </div>
+
+          <div class="card step">
+            <h3>3. Airbyte</h3>
+            <p>Connect source + trigger sync to Pinecone.</p>
+            <button id="airbyteConnectBtn">Connect to Airbyte</button>
+            <button id="syncAllBtn">Trigger Sync</button>
+            <div id="syncStatus" class="mono small"></div>
+          </div>
+
+          <div class="card step">
+            <h3>4. RAG</h3>
+            <p>Ask from this client’s namespace.</p>
+          </div>
+        </section>
+
+        <section class="docs-section">
+          <div class="section-head">
+            <h3>Links</h3>
+          </div>
+          <div id="docList" class="doc-list"></div>
+        </section>
+
+        <section class="chat-section">
+          <div class="row chat-row">
+            <input id="questionInput" type="text" placeholder="Ask from selected client knowledge base" />
+            <button id="askBtn">Ask</button>
+          </div>
+
+          <div id="answerBox" class="answer-box"></div>
+          <div id="retrievalBox" class="retrieval-box"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,59 @@
+# Replace placeholders before publishing with `flowctl catalog publish`.
+# This defines one client pipeline:
+# HTTP ingest -> collection (key=/id) -> Pinecone namespace materialization.
+
+captures:
+  YOUR_PREFIX/client-a/http-ingest:
+    endpoint:
+      connector:
+        image: ghcr.io/estuary/source-http-ingest:dev
+        config:
+          paths:
+            - /client-a-docs
+          require_auth_token: true
+          auth_token: YOUR_WEBHOOK_BEARER_TOKEN
+    bindings:
+      - resource:
+          stream: client-a-docs
+        target: YOUR_PREFIX/client-a/docs_chunks
+
+collections:
+  YOUR_PREFIX/client-a/docs_chunks:
+    schema:
+      type: object
+      required: [id, client_id, doc_id, chunk_index, chunk_text, revision, updated_at]
+      properties:
+        id:
+          type: string
+        client_id:
+          type: string
+        doc_id:
+          type: string
+        chunk_index:
+          type: integer
+        chunk_text:
+          type: string
+        revision:
+          type: string
+        source:
+          type: string
+        updated_at:
+          type: string
+    key:
+      - /id
+
+materializations:
+  YOUR_PREFIX/client-a/pinecone:
+    endpoint:
+      connector:
+        image: ghcr.io/estuary/materialize-pinecone:dev
+        config:
+          index: YOUR_PINECONE_INDEX
+          environment: YOUR_PINECONE_ENV
+          pineconeApiKey: YOUR_PINECONE_API_KEY
+          openAiApiKey: YOUR_OPENAI_API_KEY
+          embeddingModel: text-embedding-3-small
+    bindings:
+      - source: YOUR_PREFIX/client-a/docs_chunks
+        resource:
+          namespace: client-a
