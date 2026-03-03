@@ -12,6 +12,16 @@ Multi-tenant knowledge base: clients authenticate with Google (OAuth), you regis
 
 Clients authenticate **with you** (your Google OAuth app). You store tokens and call Airbyte’s API to create/update the source and connection; clients never see Airbyte.
 
+### Is “we hold tokens, Airbyte uses them” supported?
+
+Yes. This is a supported pattern:
+
+- **Airbyte Google Drive source** ([docs](https://docs.airbyte.com/integrations/sources/google-drive)): For OAuth, you can “enter your Google application’s **client ID, client secret, and refresh token**” in the connector. So the connector accepts credentials you provide (including a per-user refresh token).
+- **Your app** runs the OAuth flow (your consent screen), stores each client’s `refresh_token`, and when creating a source via the Airbyte API you pass `connectionConfiguration.credentials` with your app’s `client_id`, `client_secret`, and that client’s `refresh_token`. Airbyte stores this config and uses it to obtain access tokens and call Google Drive on behalf of that user.
+- **Per-client sources**: Each Airbyte source has its own configuration; so one source per client, each with that client’s credentials. Airbyte then fetches from each client’s Drive and writes to your Pinecone (e.g. via one shared Pinecone destination, with namespace per connection).
+
+So: you hold all authentication tokens for your clients; you act as the Airbyte API client; you pass each client’s credentials into Airbyte when creating/updating that client’s source; Airbyte performs the actual sync and populates your Pinecone. No “bring your own” limitation—this is the standard way to use OAuth sources when the OAuth flow is done in your app.
+
 ## End-to-end flow (UI)
 
 1. **Create client** — name + Pinecone namespace (e.g. `client-a`).

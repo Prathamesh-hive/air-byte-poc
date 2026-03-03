@@ -1,13 +1,20 @@
+import html
 import json
 import os
 import re
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+# Allow http://localhost for OAuth (must be set before importing google_auth_oauthlib)
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
 import requests
 from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,8 +24,6 @@ from google_auth_oauthlib.flow import Flow
 from openai import OpenAI
 from pinecone import Pinecone
 from pydantic import BaseModel
-
-load_dotenv()
 
 TENANT_STORE: Dict[str, dict] = {}
 OAUTH_STATE_TO_CLIENT: Dict[str, str] = {}
@@ -89,6 +94,8 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX", "knowledge-base")
 AIRBYTE_API_URL = os.getenv("AIRBYTE_API_URL", "http://localhost:8000").rstrip("/")
 AIRBYTE_API_KEY = os.getenv("AIRBYTE_API_KEY", "")
 AIRBYTE_WORKSPACE_ID = os.getenv("AIRBYTE_WORKSPACE_ID", "")
+AIRBYTE_CLIENT_ID = os.getenv("AIRBYTE_CLIENT_ID", "")
+AIRBYTE_CLIENT_SECRET = os.getenv("AIRBYTE_CLIENT_SECRET", "")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
@@ -106,11 +113,42 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
-# Airbyte: optional. If set, we create/update source+connection on OAuth and expose trigger-sync.
-AIRBYTE_HEADERS = {}
-if AIRBYTE_API_KEY:
-    AIRBYTE_HEADERS["Authorization"] = f"Bearer {AIRBYTE_API_KEY}"
-    AIRBYTE_HEADERS["Content-Type"] = "application/json"
+# Airbyte: optional. Need either AIRBYTE_API_KEY (static token) or AIRBYTE_CLIENT_ID + AIRBYTE_CLIENT_SECRET (Cloud token exchange).
+_AIRBYTE_TOKEN_CACHE: Dict[str, Any] = {}  # { "token": str, "expires_at": float }
+
+
+def _airbyte_bearer_token() -> str:
+    """Return Bearer token: static API key or fresh token from client credentials (Airbyte Cloud)."""
+    if AIRBYTE_API_KEY:
+        return AIRBYTE_API_KEY
+    if AIRBYTE_CLIENT_ID and AIRBYTE_CLIENT_SECRET:
+        now = datetime.now(timezone.utc).timestamp()
+        if _AIRBYTE_TOKEN_CACHE.get("token") and (_AIRBYTE_TOKEN_CACHE.get("expires_at") or 0) > now + 60:
+            return _AIRBYTE_TOKEN_CACHE["token"]
+        url = f"{AIRBYTE_API_URL}/v1/applications/token"
+        r = requests.post(
+            url,
+            json={"client_id": AIRBYTE_CLIENT_ID, "client_secret": AIRBYTE_CLIENT_SECRET},
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Airbyte token exchange failed: {r.status_code} {r.text[:300]}",
+            )
+        data = r.json()
+        token = data.get("access_token")
+        if not token:
+            raise HTTPException(status_code=502, detail="Airbyte token response missing access_token")
+        _AIRBYTE_TOKEN_CACHE["token"] = token
+        _AIRBYTE_TOKEN_CACHE["expires_at"] = now + 120
+        return token
+    return ""
+
+
+def _airbyte_configured() -> bool:
+    return bool(AIRBYTE_WORKSPACE_ID and (AIRBYTE_API_KEY or (AIRBYTE_CLIENT_ID and AIRBYTE_CLIENT_SECRET)))
 
 
 def now_iso() -> str:
@@ -170,13 +208,48 @@ def parse_state_from_redirect_url(authorization_response_url: str) -> Optional[s
 
 
 def _airbyte_request(method: str, path: str, json_body: Optional[dict] = None) -> dict:
-    if not AIRBYTE_API_KEY or not AIRBYTE_WORKSPACE_ID:
-        raise HTTPException(status_code=503, detail="Airbyte not configured (AIRBYTE_API_KEY, AIRBYTE_WORKSPACE_ID)")
+    if not AIRBYTE_WORKSPACE_ID:
+        raise HTTPException(status_code=503, detail="AIRBYTE_WORKSPACE_ID is required")
+    token = _airbyte_bearer_token()
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="Airbyte not configured: set AIRBYTE_API_KEY or (AIRBYTE_CLIENT_ID + AIRBYTE_CLIENT_SECRET)",
+        )
     url = f"{AIRBYTE_API_URL}/v1{path}"
-    r = requests.request(method, url, headers=AIRBYTE_HEADERS, json=json_body, timeout=30)
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    r = requests.request(method, url, headers=headers, json=json_body, timeout=30)
     if r.status_code >= 400:
-        raise HTTPException(status_code=min(r.status_code, 502), detail=r.text[:500])
+        detail = r.text[:800]
+        try:
+            err = r.json()
+            if isinstance(err, dict) and "detail" in err:
+                detail = err.get("detail", detail)
+        except Exception:
+            pass
+        raise HTTPException(status_code=min(r.status_code, 502), detail=detail)
     return r.json() if r.text else {}
+
+
+def _airbyte_pinecone_destination_config() -> dict:
+    """Build Pinecone destination config matching Airbyte API destination-pinecone schema (OpenAPI oneOf)."""
+    return {
+        "destinationType": "pinecone",
+        "embedding": {"mode": "openai", "openai_key": OPENAI_API_KEY},
+        "indexing": {
+            "index": PINECONE_INDEX,
+            "pinecone_key": PINECONE_API_KEY,
+            "pinecone_environment": os.getenv("PINECONE_ENV", "us-east-1"),
+        },
+        "processing": {
+            "chunk_size": 1500,
+            "chunk_overlap": 20,
+            "text_fields": ["content"],
+            "metadata_fields": [],
+            "text_splitter": {"mode": "separator", "separators": ["\n\n", "\n", " "], "keep_separator": False},
+        },
+        "omit_raw_text": False,
+    }
 
 
 def _airbyte_get_or_create_destination() -> str:
@@ -185,15 +258,12 @@ def _airbyte_get_or_create_destination() -> str:
     for d in list_res.get("destinations", []):
         if d.get("name") == "pinecone-knowledge-base":
             return d["destinationId"]
+    dest_def_id = os.getenv("AIRBYTE_DESTINATION_DEFINITION_ID_PINECONE", "3d2b6f84-7f0d-4e3f-a5e5-7c7d4b50eabd")
     create = _airbyte_request("POST", "/destinations", {
         "workspaceId": AIRBYTE_WORKSPACE_ID,
         "name": "pinecone-knowledge-base",
-        "destinationDefinitionId": os.getenv("AIRBYTE_DESTINATION_DEFINITION_ID_PINECONE", "00000000-0000-0000-0000-000000000000"),
-        "configuration": {
-            "pinecone_api_key": PINECONE_API_KEY,
-            "index": PINECONE_INDEX,
-            "embedding": {"mode": "openai", "openai_key": OPENAI_API_KEY},
-        },
+        "definitionId": dest_def_id,
+        "configuration": _airbyte_pinecone_destination_config(),
     })
     return create["destinationId"]
 
@@ -205,24 +275,34 @@ def _airbyte_create_or_update_source(client_id: str) -> str:
     credentials_from_store(client_id)
     c = tenant["credentials"]
     name = f"google-drive-{tenant.get('name', client_id)}".replace(" ", "-")[:64]
+    folder_id = (tenant or {}).get("drive_folder_id") or "root"
     config = {
+        "sourceType": "google-drive",
+        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "credentials": {
             "auth_type": "Client",
             "client_id": c["client_id"],
             "client_secret": c["client_secret"],
             "refresh_token": c["refresh_token"],
         },
-        "folder_url": f"https://drive.google.com/drive/folders/{tenant.get('drive_folder_id') or 'root'}" if tenant.get("drive_folder_id") else None,
+        "streams": [
+            {
+                "name": "documents",
+                "globs": ["**"],
+                "format": {"filetype": "unstructured"},
+                "validation_policy": "Emit Record",
+            }
+        ],
     }
     source_id = tenant.get("airbyte_source_id")
     if source_id:
-        _airbyte_request("PATCH", f"/sources/{source_id}", {"connectionConfiguration": config, "name": name})
+        _airbyte_request("PATCH", f"/sources/{source_id}", {"configuration": config, "name": name})
         return source_id
     res = _airbyte_request("POST", "/sources", {
         "workspaceId": AIRBYTE_WORKSPACE_ID,
         "name": name,
-        "sourceDefinitionId": os.getenv("AIRBYTE_SOURCE_DEFINITION_ID_GOOGLE_DRIVE", "30f72781-4b8d-4e43-b8e2-1b4c2a3d5e6f"),
-        "connectionConfiguration": config,
+        "definitionId": os.getenv("AIRBYTE_SOURCE_DEFINITION_ID_GOOGLE_DRIVE", "9f8dda77-1048-4368-815b-269bf54ee9b8"),
+        "configuration": config,
     })
     sid = res["sourceId"]
     tenant["airbyte_source_id"] = sid
@@ -236,7 +316,7 @@ def _airbyte_create_or_update_connection(client_id: str, source_id: str, destina
     payload = {
         "sourceId": source_id,
         "destinationId": destination_id,
-        "namespaceDefinition": "customformat",
+        "namespaceDefinition": "custom_format",
         "namespaceFormat": namespace,
         "syncCatalog": {"streams": []},
     }
@@ -253,9 +333,18 @@ def _airbyte_create_or_update_connection(client_id: str, source_id: str, destina
 
 def ensure_airbyte_connection(client_id: str) -> dict:
     """After OAuth: create/update Airbyte source and connection. Returns {source_id, connection_id} or raises."""
-    dest_id = _airbyte_get_or_create_destination()
-    source_id = _airbyte_create_or_update_source(client_id)
-    conn_id = _airbyte_create_or_update_connection(client_id, source_id, dest_id)
+    try:
+        dest_id = _airbyte_get_or_create_destination()
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create destination: {e.detail}")
+    try:
+        source_id = _airbyte_create_or_update_source(client_id)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create/update source: {e.detail}")
+    try:
+        conn_id = _airbyte_create_or_update_connection(client_id, source_id, dest_id)
+    except HTTPException as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create/update connection: {e.detail}")
     return {"airbyte_source_id": source_id, "airbyte_connection_id": conn_id}
 
 
@@ -505,7 +594,7 @@ def oauth_callback(req: OAuthCallbackRequest):
         "scopes": creds.scopes,
         "expiry": creds.expiry.isoformat() if creds.expiry else None,
     }
-    if AIRBYTE_API_KEY and AIRBYTE_WORKSPACE_ID:
+    if _airbyte_configured():
         try:
             ensure_airbyte_connection(req.client_id)
         except Exception:
@@ -513,55 +602,104 @@ def oauth_callback(req: OAuthCallbackRequest):
     return {"ok": True, "client_id": req.client_id}
 
 
+def _oauth_error_html(title: str, err_msg: str, status: int = 500, tb: Optional[str] = None) -> HTMLResponse:
+    tb_html = f"<pre style='background:#f5f5f5;padding:12px;overflow:auto;font-size:12px;'>{html.escape(tb or '')}</pre>" if tb else ""
+    return HTMLResponse(
+        content=f"""
+        <html><body style="font-family: sans-serif; padding: 24px; max-width: 720px;">
+        <h3>{html.escape(title)}</h3>
+        <p><strong>Error:</strong> <code>{html.escape(err_msg)}</code></p>
+        {tb_html}
+        <p>Checks: (1) GOOGLE_REDIRECT_URI in .env is exactly <code>http://localhost:8000/oauth/callback-ui</code>.
+        (2) In Google Cloud Console, Authorized redirect URIs contains that exact URL (no trailing slash).
+        (3) client_secret.json exists and is for the same GCP project. (4) If server restarted, start OAuth again from the app.</p>
+        </body></html>
+        """,
+        status_code=status,
+    )
+
+
 @app.get("/oauth/callback-ui", response_class=HTMLResponse)
 def oauth_callback_ui(request: Request):
+    try:
+        return _oauth_callback_ui_impl(request)
+    except Exception as e:
+        return _oauth_error_html(
+            "OAuth callback error",
+            str(e),
+            status=500,
+            tb=traceback.format_exc(),
+        )
+
+
+def _oauth_callback_ui_impl(request: Request) -> HTMLResponse:
     full_url = str(request.url)
     state = parse_state_from_redirect_url(full_url)
     if not state or state not in OAUTH_STATE_TO_CLIENT:
-        raise HTTPException(status_code=400, detail="Invalid or unknown OAuth state")
+        return _oauth_error_html(
+            "Invalid or expired OAuth state",
+            "State not found. If the server restarted, go back to the app and click Authenticate with Google again.",
+            status=400,
+        )
 
     client_id = OAUTH_STATE_TO_CLIENT[state]
     tenant = TENANT_STORE.get(client_id)
     if not tenant:
-        raise HTTPException(status_code=404, detail="Client not found")
+        return _oauth_error_html("Client not found", f"No tenant for client_id {client_id[:8]}...", status=404)
 
-    flow = Flow.from_client_secrets_file(
-        GOOGLE_CLIENT_SECRETS_FILE,
-        scopes=GOOGLE_SCOPES,
-        state=state,
-        redirect_uri=GOOGLE_REDIRECT_URI,
-    )
-    flow.fetch_token(authorization_response=full_url)
-    creds = flow.credentials
+    try:
+        flow = Flow.from_client_secrets_file(
+            GOOGLE_CLIENT_SECRETS_FILE,
+            scopes=GOOGLE_SCOPES,
+            state=state,
+            redirect_uri=GOOGLE_REDIRECT_URI,
+        )
+        flow.fetch_token(authorization_response=full_url)
+        creds = flow.credentials
+    except Exception as e:
+        return _oauth_error_html("OAuth token exchange failed", str(e), status=500, tb=traceback.format_exc())
 
-    tenant["credentials"] = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
-        "expiry": creds.expiry.isoformat() if creds.expiry else None,
-    }
-    if AIRBYTE_API_KEY and AIRBYTE_WORKSPACE_ID:
+    try:
+        scopes = list(creds.scopes) if getattr(creds, "scopes", None) else []
+        expiry = getattr(creds, "expiry", None)
+        tenant["credentials"] = {
+            "token": getattr(creds, "token", None),
+            "refresh_token": getattr(creds, "refresh_token", None),
+            "token_uri": getattr(creds, "token_uri", ""),
+            "client_id": getattr(creds, "client_id", ""),
+            "client_secret": getattr(creds, "client_secret", ""),
+            "scopes": scopes,
+            "expiry": expiry.isoformat() if expiry else None,
+        }
+    except Exception as e:
+        return _oauth_error_html("Failed to store credentials", str(e), status=500, tb=traceback.format_exc())
+
+    if _airbyte_configured():
         try:
             ensure_airbyte_connection(client_id)
         except Exception:
             pass
-    return f"""
-    <html>
-      <body style=\"font-family: sans-serif; padding: 24px;\">
-        <h3>OAuth success</h3>
-        <p>Account linked for client <code>{client_id}</code>. You can close this tab.</p>
-        <script>
-          if (window.opener) {{
-            window.opener.postMessage({{ type: 'oauth-success', clientId: '{client_id}' }}, '*');
-          }}
-          setTimeout(() => window.close(), 1200);
-        </script>
-      </body>
-    </html>
-    """
+
+    client_id_escaped = json.dumps(client_id)
+    return HTMLResponse(
+        content=f"""
+        <html>
+          <body style="font-family: sans-serif; padding: 24px;">
+            <h3>OAuth success</h3>
+            <p>Account linked for client <code>{html.escape(client_id)}</code>.</p>
+            <p>Redirecting back to the app...</p>
+            <script>
+              if (window.opener) {{
+                window.opener.postMessage({{ type: 'oauth-success', clientId: {client_id_escaped} }}, '*');
+                setTimeout(function() {{ window.close(); }}, 800);
+              }} else {{
+                window.location.href = '/ui/';
+              }}
+            </script>
+          </body>
+        </html>
+        """
+    )
 
 
 @app.post("/docs/register")
