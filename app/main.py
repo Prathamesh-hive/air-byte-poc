@@ -94,12 +94,14 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX", "knowledge-base")
 AIRBYTE_API_URL = os.getenv("AIRBYTE_API_URL", "http://localhost:8000").rstrip("/")
 AIRBYTE_API_KEY = os.getenv("AIRBYTE_API_KEY", "")
 AIRBYTE_WORKSPACE_ID = os.getenv("AIRBYTE_WORKSPACE_ID", "")
+AIRBYTE_REQUEST_TIMEOUT = int(os.getenv("AIRBYTE_REQUEST_TIMEOUT", "90"))
 AIRBYTE_CLIENT_ID = os.getenv("AIRBYTE_CLIENT_ID", "")
 AIRBYTE_CLIENT_SECRET = os.getenv("AIRBYTE_CLIENT_SECRET", "")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_EMBED_DIMENSIONS = int(os.getenv("OPENAI_EMBED_DIMENSIONS", "1024"))
 
 app = FastAPI(title="Multi-Tenant Google Docs Knowledge Base (Airbyte + Pinecone)")
 
@@ -128,7 +130,11 @@ def _airbyte_bearer_token() -> str:
         url = f"{AIRBYTE_API_URL}/v1/applications/token"
         r = requests.post(
             url,
-            json={"client_id": AIRBYTE_CLIENT_ID, "client_secret": AIRBYTE_CLIENT_SECRET},
+            json={
+                "client_id": AIRBYTE_CLIENT_ID,
+                "client_secret": AIRBYTE_CLIENT_SECRET,
+                "grant-type": "client_credentials",
+            },
             headers={"Content-Type": "application/json"},
             timeout=15,
         )
@@ -141,8 +147,9 @@ def _airbyte_bearer_token() -> str:
         token = data.get("access_token")
         if not token:
             raise HTTPException(status_code=502, detail="Airbyte token response missing access_token")
+        expires_in = data.get("expires_in", 900)
         _AIRBYTE_TOKEN_CACHE["token"] = token
-        _AIRBYTE_TOKEN_CACHE["expires_at"] = now + 120
+        _AIRBYTE_TOKEN_CACHE["expires_at"] = now + expires_in
         return token
     return ""
 
@@ -218,17 +225,46 @@ def _airbyte_request(method: str, path: str, json_body: Optional[dict] = None) -
         )
     url = f"{AIRBYTE_API_URL}/v1{path}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    r = requests.request(method, url, headers=headers, json=json_body, timeout=30)
+    r = requests.request(method, url, headers=headers, json=json_body, timeout=AIRBYTE_REQUEST_TIMEOUT)
     if r.status_code >= 400:
-        detail = r.text[:800]
+        detail = r.text[:1200]
         try:
             err = r.json()
-            if isinstance(err, dict) and "detail" in err:
-                detail = err.get("detail", detail)
+            if isinstance(err, dict):
+                if "detail" in err:
+                    detail = err.get("detail", detail)
+                if "_embedded" in err and isinstance(err["_embedded"], dict):
+                    emb = err["_embedded"]
+                    if "errors" in emb and isinstance(emb["errors"], list):
+                        parts = [err.get("message", "")]
+                        for e in emb["errors"][:5]:
+                            if isinstance(e, dict) and e.get("message"):
+                                parts.append(e.get("message", ""))
+                                if e.get("path"):
+                                    parts.append(f" (path: {e.get('path')})")
+                        detail = " ".join(parts) or detail
+                elif "message" in err:
+                    detail = err.get("message", detail)
+                detail = f"[HTTP {r.status_code}] {detail}"
         except Exception:
-            pass
-        raise HTTPException(status_code=min(r.status_code, 502), detail=detail)
+            detail = f"[HTTP {r.status_code}] {detail}"
+        raise HTTPException(status_code=min(r.status_code, 502), detail=str(detail))
     return r.json() if r.text else {}
+
+
+def _airbyte_request_raw(method: str, path: str, json_body: Optional[dict] = None, timeout: int = 15) -> tuple[int, str]:
+    """Call Airbyte API and return (status_code, response_text) without raising. For debugging."""
+    if not AIRBYTE_WORKSPACE_ID or not _airbyte_bearer_token():
+        return (503, "Airbyte not configured")
+    url = f"{AIRBYTE_API_URL}/v1{path}"
+    headers = {"Authorization": f"Bearer {_airbyte_bearer_token()}", "Content-Type": "application/json"}
+    try:
+        r = requests.request(method, url, headers=headers, json=json_body, timeout=timeout)
+        return (r.status_code, r.text)
+    except requests.exceptions.Timeout:
+        return (0, f"Request timed out after {timeout}s")
+    except requests.exceptions.RequestException as e:
+        return (0, str(e))
 
 
 def _airbyte_pinecone_destination_config() -> dict:
@@ -255,7 +291,8 @@ def _airbyte_pinecone_destination_config() -> dict:
 def _airbyte_get_or_create_destination() -> str:
     """Return existing Pinecone destination id or create one."""
     list_res = _airbyte_request("GET", f"/destinations?workspaceIds={AIRBYTE_WORKSPACE_ID}")
-    for d in list_res.get("destinations", []):
+    destinations = list_res.get("destinations", list_res.get("data", []))
+    for d in destinations:
         if d.get("name") == "pinecone-knowledge-base":
             return d["destinationId"]
     dest_def_id = os.getenv("AIRBYTE_DESTINATION_DEFINITION_ID_PINECONE", "3d2b6f84-7f0d-4e3f-a5e5-7c7d4b50eabd")
@@ -268,95 +305,124 @@ def _airbyte_get_or_create_destination() -> str:
     return create["destinationId"]
 
 
-def _airbyte_create_or_update_source(client_id: str) -> str:
-    tenant = TENANT_STORE.get(client_id)
-    if not tenant or "credentials" not in tenant:
-        raise HTTPException(status_code=400, detail="Client has no Google credentials")
-    credentials_from_store(client_id)
-    c = tenant["credentials"]
-    name = f"google-drive-{tenant.get('name', client_id)}".replace(" ", "-")[:64]
-    folder_id = (tenant or {}).get("drive_folder_id") or "root"
-    config = {
-        "sourceType": "google-drive",
-        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
-        "credentials": {
-            "auth_type": "Client",
-            "client_id": c["client_id"],
-            "client_secret": c["client_secret"],
-            "refresh_token": c["refresh_token"],
-        },
-        "streams": [
-            {
-                "name": "documents",
-                "globs": ["**"],
-                "format": {"filetype": "unstructured"},
-                "validation_policy": "Emit Record",
-            }
-        ],
-    }
-    source_id = tenant.get("airbyte_source_id")
-    if source_id:
-        _airbyte_request("PATCH", f"/sources/{source_id}", {"configuration": config, "name": name})
-        return source_id
-    res = _airbyte_request("POST", "/sources", {
-        "workspaceId": AIRBYTE_WORKSPACE_ID,
-        "name": name,
-        "definitionId": os.getenv("AIRBYTE_SOURCE_DEFINITION_ID_GOOGLE_DRIVE", "9f8dda77-1048-4368-815b-269bf54ee9b8"),
-        "configuration": config,
-    })
-    sid = res["sourceId"]
-    tenant["airbyte_source_id"] = sid
-    return sid
+GDRIVE_SOURCE_IMAGE = os.getenv("GDRIVE_SOURCE_IMAGE", "airbyte/source-google-drive:latest")
+CHUNK_SIZE = int(os.getenv("SYNC_CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("SYNC_CHUNK_OVERLAP", "100"))
 
 
-def _airbyte_create_or_update_connection(client_id: str, source_id: str, destination_id: str) -> str:
-    tenant = TENANT_STORE.get(client_id)
-    namespace = (tenant or {}).get("pinecone_namespace") or f"client-{client_id[:8]}"
-    conn_id = (tenant or {}).get("airbyte_connection_id")
-    payload = {
-        "sourceId": source_id,
-        "destinationId": destination_id,
-        "namespaceDefinition": "custom_format",
-        "namespaceFormat": namespace,
-        "syncCatalog": {"streams": []},
-    }
-    if conn_id:
-        _airbyte_request("PATCH", f"/connections/{conn_id}", payload)
-        return conn_id
-    payload["name"] = f"conn-{client_id[:8]}"
-    res = _airbyte_request("POST", "/connections", payload)
-    cid = res["connectionId"]
-    if tenant:
-        tenant["airbyte_connection_id"] = cid
-    return cid
+def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    if not text:
+        return []
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start : start + size])
+        start += size - overlap
+    return chunks
 
 
 def ensure_airbyte_connection(client_id: str) -> dict:
-    """After OAuth: create/update Airbyte source and connection. Returns {source_id, connection_id} or raises."""
-    try:
-        dest_id = _airbyte_get_or_create_destination()
-    except HTTPException as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create destination: {e.detail}")
-    try:
-        source_id = _airbyte_create_or_update_source(client_id)
-    except HTTPException as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create/update source: {e.detail}")
-    try:
-        conn_id = _airbyte_create_or_update_connection(client_id, source_id, dest_id)
-    except HTTPException as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Airbyte create/update connection: {e.detail}")
-    return {"airbyte_source_id": source_id, "airbyte_connection_id": conn_id}
+    """Validate credentials and Drive folder are configured. Actual sync is done by trigger-sync."""
+    tenant = TENANT_STORE.get(client_id)
+    if not tenant or "credentials" not in tenant:
+        raise HTTPException(status_code=400, detail="No Google credentials. Complete OAuth first.")
+    folder_id = tenant.get("drive_folder_id")
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="No Drive folder configured. Add a folder URL via /links/add.")
+    c = tenant["credentials"]
+    # Quick credential check via Google token refresh
+    r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={"client_id": c["client_id"], "client_secret": c["client_secret"],
+              "refresh_token": c["refresh_token"], "grant_type": "refresh_token"},
+        timeout=10,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Google token refresh failed: {r.text[:200]}")
+    tenant["credentials"]["token"] = r.json().get("access_token", c.get("token"))
+    tenant["pyairbyte_ready"] = True
+    return {"status": "ready", "folder_id": folder_id, "mode": "pyairbyte-local"}
 
 
 def airbyte_trigger_sync(client_id: str) -> dict:
+    """Run Google Drive → Pinecone sync locally using PyAirbyte + Docker."""
+    import airbyte as ab
+
     tenant = TENANT_STORE.get(client_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Client not found")
-    conn_id = tenant.get("airbyte_connection_id")
-    if not conn_id:
-        raise HTTPException(status_code=400, detail="No Airbyte connection. Complete OAuth and connect first.")
-    res = _airbyte_request("POST", "/jobs", {"connectionId": conn_id, "jobType": "sync"})
-    return {"job_id": res.get("job", {}).get("id"), "connection_id": conn_id}
+    if "credentials" not in tenant:
+        raise HTTPException(status_code=400, detail="No Google credentials. Complete OAuth first.")
+    folder_id = tenant.get("drive_folder_id")
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="No Drive folder configured.")
+
+    credentials_from_store(client_id)
+    c = tenant["credentials"]
+    namespace = tenant.get("pinecone_namespace")
+    if not namespace:
+        raise HTTPException(status_code=400, detail="No Pinecone namespace configured.")
+
+    folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+    print(f"[PyAirbyte] Starting sync for client={client_id[:8]} folder={folder_id}", flush=True)
+
+    source = ab.get_source(
+        "source-google-drive",
+        docker_image=GDRIVE_SOURCE_IMAGE,
+        config={
+            "folder_url": folder_url,
+            "credentials": {
+                "auth_type": "Client",
+                "client_id": c["client_id"],
+                "client_secret": c["client_secret"],
+                "refresh_token": c["refresh_token"],
+            },
+            "streams": [{"name": "documents", "globs": ["**"],
+                         "validation_policy": "Emit Record",
+                         "days_to_sync_if_history_is_full": 3,
+                         "format": {"filetype": "unstructured"}}],
+        },
+        streams=["documents"],
+    )
+
+    cache = ab.get_default_cache()
+    source.read(cache=cache, force_full_refresh=True)
+    df = cache["documents"].to_pandas()
+    print(f"[PyAirbyte] Read {len(df)} document(s)", flush=True)
+
+    vectors, synced_docs = [], []
+    for _, row in df.iterrows():
+        doc_key = str(row.get("document_key", ""))
+        content = str(row.get("content") or "").strip()
+        if not content:
+            print(f"[PyAirbyte] Skipping empty doc: {doc_key}", flush=True)
+            continue
+        chunks = _chunk_text(content)
+        for i, chunk in enumerate(chunks):
+            emb = openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=chunk, dimensions=OPENAI_EMBED_DIMENSIONS)
+            vec_id = f"{client_id[:8]}-{doc_key}-{i}"
+            vectors.append({
+                "id": vec_id,
+                "values": emb.data[0].embedding,
+                "metadata": {"flow_document": json.dumps(
+                    {"doc_id": doc_key, "chunk_index": i, "chunk_text": chunk}
+                )},
+            })
+        synced_docs.append({"doc_key": doc_key, "chunks": len(chunks)})
+
+    if vectors:
+        # Upsert in batches of 100
+        for batch_start in range(0, len(vectors), 100):
+            index.upsert(vectors=vectors[batch_start:batch_start + 100], namespace=namespace)
+        print(f"[PyAirbyte] Upserted {len(vectors)} vectors to Pinecone ns={namespace}", flush=True)
+
+    tenant["last_sync_at"] = now_iso()
+    return {
+        "status": "ok",
+        "documents_synced": len(synced_docs),
+        "vectors_upserted": len(vectors),
+        "docs": synced_docs,
+        "namespace": namespace,
+    }
 
 
 def parse_flow_document(metadata: dict) -> dict:
@@ -418,7 +484,7 @@ def retrieve_matches(client_id: str, query: str, top_k: int) -> List[dict]:
     if not namespace:
         raise HTTPException(status_code=400, detail="Pinecone namespace is not configured")
 
-    embed = openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=query)
+    embed = openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=query, dimensions=OPENAI_EMBED_DIMENSIONS)
     q_vec = embed.data[0].embedding
 
     response = index.query(
@@ -662,7 +728,7 @@ def _oauth_callback_ui_impl(request: Request) -> HTMLResponse:
     try:
         scopes = list(creds.scopes) if getattr(creds, "scopes", None) else []
         expiry = getattr(creds, "expiry", None)
-        tenant["credentials"] = {
+        stored_creds = {
             "token": getattr(creds, "token", None),
             "refresh_token": getattr(creds, "refresh_token", None),
             "token_uri": getattr(creds, "token_uri", ""),
@@ -671,6 +737,19 @@ def _oauth_callback_ui_impl(request: Request) -> HTMLResponse:
             "scopes": scopes,
             "expiry": expiry.isoformat() if expiry else None,
         }
+        tenant["credentials"] = stored_creds
+        # Save to file for debugging/testing
+        try:
+            with open("tokens.json", "w") as _f:
+                json.dump({
+                    "client_id": client_id,
+                    "google": stored_creds,
+                    "drive_folder_id": tenant.get("drive_folder_id"),
+                    "saved_at": now_iso(),
+                }, _f, indent=2)
+            print(f"[OAuth] tokens saved to tokens.json", flush=True)
+        except Exception as _e:
+            print(f"[OAuth] WARNING: could not save tokens.json: {_e}", flush=True)
     except Exception as e:
         return _oauth_error_html("Failed to store credentials", str(e), status=500, tb=traceback.format_exc())
 
@@ -748,9 +827,68 @@ def add_link(req: AddLinkRequest):
     )
 
 
+@app.post("/airbyte/debug-source")
+def airbyte_debug_source(req: OAuthInitRequest, variant: Optional[str] = None):
+    """
+    Debug: try source config variant(s) and return raw Airbyte responses.
+    No query: tries all 3 (minimal, csv, unstructured). ?variant=minimal (or csv|unstructured): try only that one.
+    """
+    if req.client_id not in TENANT_STORE:
+        raise HTTPException(status_code=404, detail="Client not found")
+    tenant = TENANT_STORE[req.client_id]
+    if "credentials" not in tenant:
+        raise HTTPException(status_code=400, detail="No Google credentials")
+    credentials_from_store(req.client_id)
+    c = tenant["credentials"]
+    folder_id = tenant.get("drive_folder_id") or "root"
+    def_id = os.getenv("AIRBYTE_SOURCE_DEFINITION_ID_GOOGLE_DRIVE", "9f8dda77-1048-4368-815b-269bf54ee9b8")
+    base_cred = {"auth_type": "Client", "client_id": c["client_id"], "client_secret": c["client_secret"], "refresh_token": c["refresh_token"]}
+    folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+    variants = {
+        "minimal": {"folder_url": folder_url, "credentials": base_cred, "streams": [{"name": "s1", "globs": ["**"]}]},
+        "csv": {
+            "folder_url": folder_url,
+            "credentials": base_cred,
+            "streams": [{
+                "name": "stream1", "globs": ["**"],
+                "validation_policy": "Emit Record", "days_to_sync_if_history_is_full": 3,
+                "format": {"filetype": "csv", "header_definition": {"header_definition_type": "From CSV"}},
+            }],
+        },
+        "unstructured": {
+            "folder_url": folder_url,
+            "credentials": base_cred,
+            "streams": [{"name": "documents", "globs": ["**"], "validation_policy": "Emit Record", "days_to_sync_if_history_is_full": 3, "format": {"filetype": "unstructured"}}],
+        },
+    }
+    if variant:
+        if variant not in variants:
+            raise HTTPException(status_code=400, detail=f"variant must be one of: minimal, csv, unstructured")
+        variants = {variant: variants[variant]}
+
+    results = []
+    for variant, config in variants.items():
+        body = {"workspaceId": AIRBYTE_WORKSPACE_ID, "name": f"debug-{variant}-{req.client_id[:8]}", "definitionId": def_id, "configuration": config}
+        status, text = _airbyte_request_raw("POST", "/sources", body, timeout=15)
+        results.append({
+            "variant": variant,
+            "response_status": status,
+            "response_body": text[:3000],
+            "success": 200 <= status < 300,
+        })
+
+    return {
+        "client_id": req.client_id,
+        "airbyte_url": f"{AIRBYTE_API_URL}/v1/sources",
+        "results": results,
+        "summary": {r["variant"]: "OK" if r["success"] else ("Timeout" if r["response_status"] == 0 else f"HTTP {r['response_status']}") for r in results},
+    }
+
+
 @app.post("/airbyte/connect")
 def airbyte_connect(req: OAuthInitRequest):
-    """Create or update Airbyte source + connection for this client (requires OAuth done)."""
+    """Validate credentials and Drive folder are ready for sync (requires OAuth done)."""
     if req.client_id not in TENANT_STORE:
         raise HTTPException(status_code=404, detail="Client not found")
     return ensure_airbyte_connection(req.client_id)
@@ -758,8 +896,28 @@ def airbyte_connect(req: OAuthInitRequest):
 
 @app.post("/airbyte/trigger-sync")
 def airbyte_trigger_sync_endpoint(req: SyncAllRequest):
-    """Trigger an Airbyte sync for the client's connection. Airbyte will fetch updates and push to Pinecone."""
+    """Sync Google Drive → Pinecone via PyAirbyte (runs connector locally in Docker)."""
+    if req.client_id not in TENANT_STORE:
+        raise HTTPException(status_code=404, detail="Client not found")
     return airbyte_trigger_sync(req.client_id)
+
+
+@app.delete("/airbyte/cleanup-sources")
+def airbyte_cleanup_sources():
+    """Delete all stale/duplicate Google Drive sources in the workspace (keeps none). Use before reconnecting."""
+    if not _airbyte_configured():
+        raise HTTPException(status_code=503, detail="Airbyte not configured")
+    res = _airbyte_request("GET", f"/sources?workspaceIds={AIRBYTE_WORKSPACE_ID}")
+    sources = res.get("data", [])
+    deleted, errors = [], []
+    for s in sources:
+        sid = s.get("sourceId")
+        try:
+            _airbyte_request("DELETE", f"/sources/{sid}")
+            deleted.append(sid)
+        except Exception as e:
+            errors.append({"sourceId": sid, "error": str(e)})
+    return {"deleted": len(deleted), "errors": errors, "deleted_ids": deleted}
 
 
 @app.post("/query")
