@@ -9,3 +9,5 @@ pydantic==2.9.2
 openai==1.51.2
 httpx<0.28
 requests==2.32.3
+# Optional: airbyte-api for SDK-based connection create (first variant tried)
+airbyte-api>=0.53.0

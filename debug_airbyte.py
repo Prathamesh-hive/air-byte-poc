@@ -5,12 +5,22 @@ Run AFTER doing OAuth in the app (tokens.json will be auto-created).
 
 Usage:
   python debug_airbyte.py
+  VERIFY_PINECONE_API_KEY=pcsk_... PINECONE_INDEX=pm-test python debug_airbyte.py
 """
 import json, os, sys, time, subprocess, textwrap
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Pinecone: use VERIFY_PINECONE_API_KEY for script-only override, index default knowledge-base
+PINECONE_KEY = os.getenv("VERIFY_PINECONE_API_KEY") or os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "pm-test")
+if PINECONE_KEY:
+    os.environ["PINECONE_API_KEY"] = PINECONE_KEY
+if not PINECONE_KEY:
+    print("WARNING: PINECONE_API_KEY / VERIFY_PINECONE_API_KEY not set.")
+print(f"Using PINECONE_INDEX={PINECONE_INDEX}")
 
 # ── Load real Google tokens ──────────────────────────────────────────────────
 if not os.path.exists("tokens.json"):
@@ -37,7 +47,6 @@ print()
 AB_CLIENT_ID     = os.getenv("AIRBYTE_CLIENT_ID")
 AB_CLIENT_SECRET = os.getenv("AIRBYTE_CLIENT_SECRET")
 WORKSPACE_ID     = os.getenv("AIRBYTE_WORKSPACE_ID")
-DEST_ID          = "c696c32b-54ca-47a7-a5b7-86f58770628b"
 
 r = requests.post(
     "https://api.airbyte.com/v1/applications/token",
@@ -47,6 +56,58 @@ r = requests.post(
 AB_TOKEN = r.json()["access_token"]
 AB_HEADERS = {"Authorization": f"Bearer {AB_TOKEN}", "Content-Type": "application/json"}
 print(f"Airbyte token obtained: {AB_TOKEN[:30]}...")
+print()
+
+# ── Get or create Pinecone destination (uses PINECONE_API_KEY, PINECONE_INDEX) ──
+print("=" * 60)
+print("STEP 0: Get or create Pinecone destination (pm-test)")
+print("=" * 60)
+DEST_ID = os.getenv("AIRBYTE_DESTINATION_ID", "").strip()
+if DEST_ID:
+    print(f"  Using AIRBYTE_DESTINATION_ID={DEST_ID[:8]}...")
+else:
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    embed_dim = int(os.getenv("OPENAI_EMBED_DIMENSIONS", "1536"))
+    dest_config = {
+        "destinationType": "pinecone",
+        "embedding": {"mode": "openai", "openai_key": openai_key, "dimensions": embed_dim},
+        "indexing": {
+            "index": PINECONE_INDEX,
+            "pinecone_key": PINECONE_KEY,
+            "pinecone_environment": os.getenv("PINECONE_ENV", "us-east-1"),
+        },
+        "processing": {
+            "chunk_size": 997,
+            "chunk_overlap": 20,
+            "text_fields": ["content"],
+            "metadata_fields": [],
+            "text_splitter": {"mode": "separator", "separators": ["\n\n", "\n"], "keep_separator": False},
+        },
+        "omit_raw_text": False,
+    }
+    dest_def_id = os.getenv("AIRBYTE_DESTINATION_DEFINITION_ID_PINECONE", "3d2b6f84-7f0d-4e3f-a5e5-7c7d4b50eabd")
+    r_dests = requests.get(f"https://api.airbyte.com/v1/destinations?workspaceIds={WORKSPACE_ID}", headers=AB_HEADERS, timeout=15)
+    dests = (r_dests.json().get("destinations") or r_dests.json().get("data") or [])
+    for d in dests:
+        if d.get("name") == f"pinecone-{PINECONE_INDEX}":
+            DEST_ID = d.get("destinationId") or d.get("id", "")
+            r_patch = requests.patch(f"https://api.airbyte.com/v1/destinations/{DEST_ID}", headers=AB_HEADERS, json={"configuration": dest_config}, timeout=30)
+            print(f"  PATCH existing destination -> {r_patch.status_code}")
+            break
+    if not DEST_ID:
+        r_create = requests.post("https://api.airbyte.com/v1/destinations", headers=AB_HEADERS, json={
+            "workspaceId": WORKSPACE_ID,
+            "name": f"pinecone-{PINECONE_INDEX}",
+            "definitionId": dest_def_id,
+            "configuration": dest_config,
+        }, timeout=30)
+        if r_create.status_code in (200, 201):
+            DEST_ID = r_create.json().get("destinationId") or r_create.json().get("id", "")
+            print(f"  Created destination: {DEST_ID[:8]}...")
+        else:
+            print(f"  CREATE destination failed: {r_create.status_code} {r_create.text[:300]}")
+            sys.exit(1)
+print(f"  DEST_ID={DEST_ID[:8] if DEST_ID else 'MISSING'}...")
 print()
 
 # ── Step 1: Verify Google credentials directly ────────────────────────────────
